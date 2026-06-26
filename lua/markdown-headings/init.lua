@@ -1,5 +1,6 @@
 -- markdown-headings.nvim
--- Telescope heading picker and [/] heading navigation for Markdown files.
+-- Telescope heading picker, [/] heading navigation, and gf link following
+-- for Markdown files.
 -- Supports both ATX (# ...) and Setext (=== / ---) headings.
 -- Auto-detects which format the file uses and parses only that style.
 
@@ -149,9 +150,54 @@ function M.jump(direction, level)
   end
 end
 
---- Set up buffer-local keymaps for heading navigation.
+--- Jump to a #heading anchor in the current buffer.
+--- Converts heading text to a GitHub-style slug (lowercase, spaces to hyphens,
+--- strip punctuation) and searches for the first matching heading.
+--- Uses M.parse() so both ATX and Setext headings are found.
+---@param anchor string  anchor with or without leading '#'
+---@return boolean  true if the heading was found
+function M.jump_to_anchor(anchor)
+  anchor = anchor:gsub('^#', '')
+  for _, h in ipairs(M.parse()) do
+    local slug = h.text:lower():gsub('[^%w%s-]', ''):gsub('%s+', '-')
+    if slug == anchor then
+      vim.api.nvim_win_set_cursor(0, { h.lnum, 0 })
+      return true
+    end
+  end
+  vim.notify('Heading not found: #' .. anchor, vim.log.levels.WARN)
+  return false
+end
+
+--- Follow the markdown link under or around the cursor.
+--- Handles URLs (opens externally), internal anchors (#heading), file links,
+--- and combined file+anchor links (path.md#heading).
+--- Falls back to normal gf if the cursor is not inside a [text](path) link.
+function M.follow_link()
+  local line = vim.api.nvim_get_current_line()
+  local col = vim.api.nvim_win_get_cursor(0)[2] + 1
+  for link_start, path, link_end in line:gmatch('()%[.-%]%((.-)()%)') do
+    if col >= link_start and col < link_end then
+      if path:match('^https?://') then
+        vim.ui.open(path)
+      elseif path:match('^#') then
+        M.jump_to_anchor(path)
+      else
+        local file, anchor = path:match('^(.-)(#.+)$')
+        file = file or path
+        local dir = vim.fn.expand('%:p:h')
+        vim.cmd('edit ' .. vim.fn.fnameescape(dir .. '/' .. file))
+        if anchor then M.jump_to_anchor(anchor) end
+      end
+      return
+    end
+  end
+  vim.cmd('normal! gf')
+end
+
+--- Set up buffer-local keymaps for heading navigation and link following.
 --- Called automatically via FileType autocmd, or manually.
----@param opts? { jump_keys?: table<string,{direction:string,level:integer}> }
+---@param opts? { jump_keys?: table<string,{direction:string,level:integer}>, follow_links?: boolean }
 function M.setup(opts)
   opts = opts or {}
 
@@ -162,6 +208,8 @@ function M.setup(opts)
     ['[2'] = { direction = 'backward', level = 2 },
   }
 
+  local follow_links = opts.follow_links ~= false  -- default: true
+
   local augroup = vim.api.nvim_create_augroup('MarkdownHeadings', { clear = true })
   vim.api.nvim_create_autocmd('FileType', {
     group = augroup,
@@ -171,6 +219,10 @@ function M.setup(opts)
         vim.keymap.set('n', key, function()
           M.jump(mapping.direction, mapping.level)
         end, { buffer = true, silent = true, desc = mapping.direction .. ' heading ' .. mapping.level })
+      end
+      if follow_links then
+        vim.keymap.set('n', 'gf', M.follow_link,
+          { buffer = true, silent = true, desc = 'Follow markdown link' })
       end
     end,
   })

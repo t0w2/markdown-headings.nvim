@@ -1,6 +1,7 @@
 # markdown-headings.nvim
 
-Telescope heading picker and `]`/`[` heading navigation for Markdown files.
+Telescope heading picker, `]`/`[` heading navigation, and `gf` link
+following for Markdown files.
 
 - **Auto-detects format**: counts ATX (`#`) vs Setext (`===`/`---`) headings
   and parses only the dominant style — no mixed-format noise.
@@ -9,6 +10,10 @@ Telescope heading picker and `]`/`[` heading navigation for Markdown files.
   level. Pre-selects the heading the cursor is currently inside.
 - **Jump mappings**: `]1`/`[1` and `]2`/`[2` jump to next/previous heading
   at that level. Works with both ATX and Setext headings.
+- **Link following**: `gf` follows `[text](path)` links — URLs open
+  externally, `#anchors` jump to headings, file links open the file,
+  and `path.md#heading` opens the file then jumps to the anchor.
+  Falls back to normal `gf` outside of markdown links.
 
 ## Installation
 
@@ -53,6 +58,25 @@ After `setup()`, these buffer-local mappings are active in Markdown files:
 | `]2` | Next level-2 heading      |
 | `[2` | Previous level-2 heading  |
 
+### Link following
+
+After `setup()`, `gf` is overridden in Markdown buffers to follow
+`[text](path)` links. The cursor can be anywhere inside the link syntax
+(on the text or the path).
+
+| Link type | Example | Action |
+|---|---|---|
+| URL | `[docs](https://example.com)` | Opens in external browser via `vim.ui.open()` |
+| Internal anchor | `[see below](#installation)` | Jumps to the matching heading in the current buffer |
+| File link | `[readme](other.md)` | Opens the file (relative to the current file's directory) |
+| File + anchor | `[api](other.md#setup)` | Opens the file, then jumps to the heading |
+
+Anchor matching uses GitHub-style slug conversion: lowercase, spaces to
+hyphens, punctuation stripped. If the cursor is not inside a markdown link,
+`gf` falls back to its default Neovim behavior.
+
+To disable link following: `require('markdown-headings').setup({ follow_links = false })`
+
 ### Custom jump keys
 
 ```lua
@@ -79,6 +103,12 @@ local headings = mh.parse()        -- returns { { lnum, level, text }, ... }
 -- Jump programmatically
 mh.jump('forward', 1)              -- next H1
 mh.jump('backward', 2)             -- previous H2
+
+-- Jump to an anchor in the current buffer (GitHub-style slug matching)
+mh.jump_to_anchor('installation')  -- returns true if found
+
+-- Follow the markdown link under the cursor
+mh.follow_link()                   -- handles URLs, anchors, files, file+anchor
 ```
 
 ## Format detection
