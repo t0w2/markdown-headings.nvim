@@ -3,9 +3,10 @@
 Telescope heading picker, `]`/`[` heading navigation, and `gf` link
 following for Markdown files.
 
-- **Auto-detects format**: counts ATX (`#`) vs Setext (`===`/`---`) headings
-  and parses only the dominant style — no mixed-format noise.
-- **Skips fenced code blocks**: headings inside `` ``` `` blocks are ignored.
+- **Mixed heading parsing**: supports ATX (`#`) and Setext (`===`/`---`)
+  headings in the same file by default.
+- **Skips non-content regions**: headings inside fenced code blocks and YAML
+  front matter are ignored.
 - **Telescope picker**: fuzzy-searchable heading list with indentation by
   level. Pre-selects the heading the cursor is currently inside.
 - **Jump mappings**: `]1`/`[1` and `]2`/`[2` jump to next/previous heading
@@ -70,17 +71,21 @@ After `setup()`, `gf` is overridden in Markdown buffers to follow
 | Internal anchor | `[see below](#installation)` | Jumps to the matching heading in the current buffer |
 | File link | `[readme](other.md)` | Opens the file (relative to the current file's directory) |
 | File + anchor | `[api](other.md#setup)` | Opens the file, then jumps to the heading |
+| Spaces | `[file](<foo bar.md>)` | Opens an angle-bracket destination |
+| Title | `[file](foo.md "Title")` | Ignores the optional title and opens the file |
 
 Anchor matching uses GitHub-style slug conversion: lowercase, spaces to
-hyphens, punctuation stripped. If the cursor is not inside a markdown link,
+hyphens, punctuation stripped, duplicate headings suffixed with `-1`, `-2`,
+and URI-encoded anchors decoded. If the cursor is not inside a markdown link,
 `gf` falls back to its default Neovim behavior.
 
 To disable link following: `require('markdown-headings').setup({ follow_links = false })`
 
-### Custom jump keys
+### Setup options
 
 ```lua
 require('markdown-headings').setup({
+  style = 'mixed', -- 'mixed' (default), 'auto', 'atx', or 'setext'
   jump_keys = {
     [']1'] = { direction = 'forward',  level = 1 },
     ['[1'] = { direction = 'backward', level = 1 },
@@ -98,7 +103,8 @@ require('markdown-headings').setup({
 local mh = require('markdown-headings')
 
 -- Parse headings from current buffer (or specify bufnr)
-local headings = mh.parse()        -- returns { { lnum, level, text }, ... }
+local headings = mh.parse()        -- returns { { lnum, end_lnum, level, text }, ... }
+local atx_only = mh.parse(0, { style = 'atx' })
 
 -- Jump programmatically
 mh.jump('forward', 1)              -- next H1
@@ -111,11 +117,25 @@ mh.jump_to_anchor('installation')  -- returns true if found
 mh.follow_link()                   -- handles URLs, anchors, files, file+anchor
 ```
 
-## Format detection
+## Heading style modes
 
-The parser counts ATX (`# heading`) and Setext (underline `===`/`---`)
-heading candidates outside fenced code blocks. Whichever style has more
-occurrences wins — the other style is ignored entirely. Ties go to Setext.
+By default, the parser uses `style = 'mixed'` and includes both ATX
+(`# heading`) and Setext (underline `===`/`---`) headings in file order.
 
-This means a Setext-formatted file won't pick up stray `#` lines as
-headings, and an ATX file won't treat `---` horizontal rules as H2.
+Other modes are available through `setup({ style = ... })` or
+`parse(bufnr, { style = ... })`:
+
+| Style | Behavior |
+|---|---|
+| `mixed` | Parse ATX and Setext headings together |
+| `auto` | Count both styles and parse only the dominant style; ties choose Setext |
+| `atx` | Parse only ATX headings |
+| `setext` | Parse only Setext headings |
+
+## Tests
+
+Run the headless Neovim regression suite with:
+
+```sh
+nvim --headless -u NONE --noplugin -l tests/minimal.lua
+```

@@ -1,60 +1,186 @@
 -- markdown-headings.nvim
 -- Telescope heading picker, [/] heading navigation, and gf link following
 -- for Markdown files.
--- Supports both ATX (# ...) and Setext (=== / ---) headings.
--- Auto-detects which format the file uses and parses only that style.
+-- Supports mixed ATX (# ...) and Setext (=== / ---) headings.
 
 local M = {}
 
+local function trim(text)
+  return (text:gsub('^%s+', ''):gsub('%s+$', ''))
+end
+
+local function parse_atx(line)
+  local indent, rest = line:match('^( *)(.*)$')
+  if #indent > 3 then return nil end
+
+  local hashes = rest:match('^(#+)')
+  if not hashes or #hashes > 6 then return nil end
+
+  local text = rest:sub(#hashes + 1)
+  if text ~= '' and not text:match('^[ \t]') then return nil end
+
+  text = trim(text):gsub('[ \t]+#+[ \t]*$', '')
+  return #hashes, trim(text)
+end
+
+local function setext_level(line)
+  local indent, rest = line:match('^( *)(.*)$')
+  if #indent > 3 then return nil end
+
+  rest = trim(rest)
+  if rest:match('^=+$') then return 1 end
+  if rest:match('^%-+$') then return 2 end
+  return nil
+end
+
+local function fence_start(line)
+  local indent, rest = line:match('^( *)(.*)$')
+  if #indent > 3 then return nil end
+
+  local ticks = rest:match('^(```+)')
+  if ticks then return '`', #ticks end
+
+  local tildes = rest:match('^(~~~+)')
+  if tildes then return '~', #tildes end
+
+  return nil
+end
+
+local function fence_closes(line, fence_char, fence_len)
+  local indent, rest = line:match('^( *)(.*)$')
+  if #indent > 3 then return false end
+
+  local chars
+  if fence_char == '`' then
+    chars = rest:match('^(`+)%s*$')
+  else
+    chars = rest:match('^(~+)%s*$')
+  end
+
+  return chars and #chars >= fence_len
+end
+
+local function fenced_lines(lines)
+  local in_fence = {}
+  local fence_char, fence_len
+
+  for i, line in ipairs(lines) do
+    if fence_char then
+      in_fence[i] = true
+      if fence_closes(line, fence_char, fence_len) then
+        fence_char, fence_len = nil, nil
+      end
+    else
+      local char, len = fence_start(line)
+      if char then
+        in_fence[i] = true
+        fence_char, fence_len = char, len
+      end
+    end
+  end
+
+  return in_fence
+end
+
+local function slugify(text)
+  return text:lower()
+    :gsub('[^%w%s-]', '')
+    :gsub('%s+', '-')
+    :gsub('^-+', '')
+    :gsub('-+$', '')
+end
+
+local function percent_decode(text)
+  return (text:gsub('%%(%x%x)', function(hex)
+    return string.char(tonumber(hex, 16))
+  end))
+end
+
+local function normalize_anchor(anchor)
+  return slugify(percent_decode(anchor:gsub('^#', '')))
+end
+
+local default_jump_keys = {
+  [']1'] = { direction = 'forward',  level = 1 },
+  ['[1'] = { direction = 'backward', level = 1 },
+  [']2'] = { direction = 'forward',  level = 2 },
+  ['[2'] = { direction = 'backward', level = 2 },
+}
+
+local config = {
+  jump_keys = default_jump_keys,
+  follow_links = true,
+  style = 'mixed',
+}
+
+local attached_keys = {}
+
+local function mark_front_matter(lines, ignored)
+  if not lines[1] or not lines[1]:match('^%-%-%-%s*$') then return end
+
+  for i = 2, #lines do
+    if lines[i]:match('^%-%-%-%s*$') or lines[i]:match('^%.%.%.%s*$') then
+      for lnum = 1, i do
+        ignored[lnum] = true
+      end
+      return
+    end
+  end
+end
+
 --- Parse all headings from a buffer.
---- Returns a list of { lnum = int, level = int, text = string } in file order.
+--- Returns a list of { lnum = int, end_lnum = int, level = int, text = string } in file order.
 ---@param bufnr? integer  buffer handle (default: current buffer)
+---@param opts? { style?: "mixed"|"auto"|"atx"|"setext" }
 ---@return table[] headings
-function M.parse(bufnr)
+function M.parse(bufnr, opts)
+  if type(bufnr) == 'table' then
+    opts = bufnr
+    bufnr = 0
+  end
+
   bufnr = bufnr or 0
+  opts = opts or {}
+  local style = opts.style or config.style
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
 
   -- Build set of lines inside fenced code blocks
-  local in_fence = {}
-  local fence = false
-  for i, line in ipairs(lines) do
-    if line:match('^```') then fence = not fence end
-    if fence then in_fence[i] = true end
+  local ignored = fenced_lines(lines)
+  mark_front_matter(lines, ignored)
+
+  local function setext_candidate(i)
+    if i >= #lines or ignored[i] or ignored[i + 1] or not lines[i]:match('%S') then return nil end
+    if parse_atx(lines[i]) then return nil end
+    return setext_level(lines[i + 1])
   end
 
-  -- Count ATX vs setext candidates (outside code blocks) to pick format
-  local atx_n, setext_n = 0, 0
-  for i, line in ipairs(lines) do
-    if not in_fence[i] then
-      if line:match('^#+%s+') then atx_n = atx_n + 1 end
-      if i < #lines and not in_fence[i + 1] and line:match('%S') then
-        local next_line = lines[i + 1]
-        if next_line:match('^===+%s*$') or next_line:match('^%-%-%-+%s*$') then
-          setext_n = setext_n + 1
-        end
+  -- Count ATX vs setext candidates (outside ignored regions) to pick format
+  if style == 'auto' then
+    local atx_n, setext_n = 0, 0
+    for i, line in ipairs(lines) do
+      if not ignored[i] then
+        if parse_atx(line) then atx_n = atx_n + 1 end
+        if setext_candidate(i) then setext_n = setext_n + 1 end
       end
     end
+    style = (setext_n >= atx_n) and 'setext' or 'atx'
+  end
+
+  if style ~= 'atx' and style ~= 'setext' and style ~= 'mixed' then
+    style = 'mixed'
   end
 
   local headings = {}
-  if setext_n >= atx_n then
-    for i = 1, #lines - 1 do
-      if not in_fence[i] and not in_fence[i + 1] and lines[i]:match('%S') then
-        local next_line = lines[i + 1]
-        if next_line:match('^===+%s*$') then
-          headings[#headings + 1] = { lnum = i, level = 1, text = lines[i] }
-        elseif next_line:match('^%-%-%-+%s*$') then
-          headings[#headings + 1] = { lnum = i, level = 2, text = lines[i] }
-        end
+  for i, line in ipairs(lines) do
+    if not ignored[i] then
+      local atx_level, text = parse_atx(line)
+      if atx_level and (style == 'atx' or style == 'mixed') then
+        headings[#headings + 1] = { lnum = i, end_lnum = i, level = atx_level, text = text }
       end
-    end
-  else
-    for i, line in ipairs(lines) do
-      if not in_fence[i] then
-        local hashes, text = line:match('^(#+)%s+(.*)')
-        if hashes then
-          headings[#headings + 1] = { lnum = i, level = #hashes, text = text }
-        end
+
+      local setext = setext_candidate(i)
+      if setext and (style == 'setext' or style == 'mixed') then
+        headings[#headings + 1] = { lnum = i, end_lnum = i + 1, level = setext, text = trim(line) }
       end
     end
   end
@@ -105,47 +231,22 @@ end
 ---@param level integer  heading level (1 or 2 for setext, 1-6 for ATX)
 function M.jump(direction, level)
   local start_line = vim.fn.line('.')
-  local total_lines = vim.api.nvim_buf_line_count(0)
-  local atx_pat = '^' .. string.rep('#', level) .. '%s'
-  local setext_esc = (level == 1) and '=' or '%-'
-  local setext_pat = '^' .. string.rep(setext_esc, 3) .. '+%s*$'
-
-  -- Check if lnum is (part of) a heading at the target level.
-  -- Returns the heading text line number, or nil.
-  local function heading_line(lnum)
-    if lnum < 1 or lnum > total_lines then return nil end
-    local line = vim.fn.getline(lnum)
-    -- ATX heading: exact level (## won't match ###)
-    if line:match(atx_pat) then return lnum end
-    -- Setext: underline line with non-blank text above
-    if line:match(setext_pat) and lnum > 1
-       and vim.fn.getline(lnum - 1):match('%S') then
-      return lnum - 1
-    end
-    return nil
-  end
-
-  -- Determine the line range to skip (current heading block, if any).
-  -- Handles cursor on ATX line, setext text line, or setext underline.
-  local skip_lo, skip_hi = start_line, start_line
-  if start_line < total_lines
-     and vim.fn.getline(start_line + 1):match(setext_pat)
-     and vim.fn.getline(start_line):match('%S') then
-    skip_hi = start_line + 1       -- cursor on setext text line
-  end
-  if vim.fn.getline(start_line):match(setext_pat) and start_line > 1 then
-    skip_lo = start_line - 1       -- cursor on setext underline
-  end
+  local headings = M.parse()
 
   if direction == 'forward' then
-    for lnum = skip_hi + 1, total_lines do
-      local target = heading_line(lnum)
-      if target then vim.fn.cursor(target, 1); return end
+    for _, h in ipairs(headings) do
+      if h.level == level and h.lnum > start_line then
+        vim.fn.cursor(h.lnum, 1)
+        return
+      end
     end
   else
-    for lnum = skip_lo - 1, 1, -1 do
-      local target = heading_line(lnum)
-      if target then vim.fn.cursor(target, 1); return end
+    for i = #headings, 1, -1 do
+      local h = headings[i]
+      if h.level == level and (h.end_lnum or h.lnum) < start_line then
+        vim.fn.cursor(h.lnum, 1)
+        return
+      end
     end
   end
 end
@@ -157,16 +258,161 @@ end
 ---@param anchor string  anchor with or without leading '#'
 ---@return boolean  true if the heading was found
 function M.jump_to_anchor(anchor)
-  anchor = anchor:gsub('^#', '')
+  local target = normalize_anchor(anchor)
+  local seen = {}
+
   for _, h in ipairs(M.parse()) do
-    local slug = h.text:lower():gsub('[^%w%s-]', ''):gsub('%s+', '-')
-    if slug == anchor then
+    local base = slugify(h.text)
+    local count = seen[base] or 0
+    local slug = count == 0 and base or (base .. '-' .. count)
+    seen[base] = count + 1
+
+    if slug == target then
       vim.api.nvim_win_set_cursor(0, { h.lnum, 0 })
       return true
     end
   end
-  vim.notify('Heading not found: #' .. anchor, vim.log.levels.WARN)
+
+  vim.notify('Heading not found: #' .. target, vim.log.levels.WARN)
   return false
+end
+
+local function matching_bracket(line, open)
+  local depth = 1
+  local i = open + 1
+
+  while i <= #line do
+    local ch = line:sub(i, i)
+    if ch == '\\' then
+      i = i + 2
+    elseif ch == '[' then
+      depth = depth + 1
+      i = i + 1
+    elseif ch == ']' then
+      depth = depth - 1
+      if depth == 0 then return i end
+      i = i + 1
+    else
+      i = i + 1
+    end
+  end
+
+  return nil
+end
+
+local function closing_paren_after_title(line, start)
+  local i = start
+  while line:sub(i, i):match('%s') do i = i + 1 end
+  if line:sub(i, i) == ')' then return i end
+
+  local quote = line:sub(i, i)
+  if quote == '"' or quote == "'" then
+    i = i + 1
+    while i <= #line do
+      local ch = line:sub(i, i)
+      if ch == '\\' then
+        i = i + 2
+      elseif ch == quote then
+        i = i + 1
+        break
+      else
+        i = i + 1
+      end
+    end
+  elseif quote == '(' then
+    local depth = 1
+    i = i + 1
+    while i <= #line do
+      local ch = line:sub(i, i)
+      if ch == '\\' then
+        i = i + 2
+      elseif ch == '(' then
+        depth = depth + 1
+        i = i + 1
+      elseif ch == ')' then
+        depth = depth - 1
+        i = i + 1
+        if depth == 0 then break end
+      else
+        i = i + 1
+      end
+    end
+  else
+    return nil
+  end
+
+  while line:sub(i, i):match('%s') do i = i + 1 end
+  if line:sub(i, i) == ')' then return i end
+  return nil
+end
+
+local function parse_link_destination(line, start)
+  local i = start
+  while line:sub(i, i):match('%s') do i = i + 1 end
+
+  if line:sub(i, i) == '<' then
+    local close = line:find('>', i + 1, true)
+    if not close then return nil end
+
+    local finish = closing_paren_after_title(line, close + 1)
+    if not finish then return nil end
+    return line:sub(i + 1, close - 1), finish
+  end
+
+  local depth = 0
+  local j = i
+  while j <= #line do
+    local ch = line:sub(j, j)
+    if ch == '\\' then
+      j = j + 2
+    elseif ch == '(' then
+      depth = depth + 1
+      j = j + 1
+    elseif ch == ')' then
+      if depth == 0 then
+        return trim(line:sub(i, j - 1)), j
+      end
+      depth = depth - 1
+      j = j + 1
+    elseif ch:match('%s') and depth == 0 then
+      local finish = closing_paren_after_title(line, j)
+      if not finish then return nil end
+      return trim(line:sub(i, j - 1)), finish
+    else
+      j = j + 1
+    end
+  end
+
+  return nil
+end
+
+local function link_at_cursor(line, col)
+  local i = 1
+  while i <= #line do
+    local open = line:find('[', i, true)
+    if not open then return nil end
+
+    local close = matching_bracket(line, open)
+    if close and line:sub(close + 1, close + 1) == '(' then
+      local path, finish = parse_link_destination(line, close + 2)
+      if path and col >= open and col <= finish then
+        return path
+      end
+      i = (finish or close) + 1
+    else
+      i = open + 1
+    end
+  end
+
+  return nil
+end
+
+local function edit_file(path)
+  local file = percent_decode(path)
+  if not file:match('^/') and not file:match('^~[/\\]') then
+    file = vim.fn.expand('%:p:h') .. '/' .. file
+  end
+  vim.cmd('edit ' .. vim.fn.fnameescape(vim.fn.expand(file)))
 end
 
 --- Follow the markdown link under or around the cursor.
@@ -176,56 +422,75 @@ end
 function M.follow_link()
   local line = vim.api.nvim_get_current_line()
   local col = vim.api.nvim_win_get_cursor(0)[2] + 1
-  for link_start, path, link_end in line:gmatch('()%[.-%]%((.-)()%)') do
-    if col >= link_start and col < link_end then
-      if path:match('^https?://') then
-        vim.ui.open(path)
-      elseif path:match('^#') then
-        M.jump_to_anchor(path)
-      else
-        local file, anchor = path:match('^(.-)(#.+)$')
-        file = file or path
-        local dir = vim.fn.expand('%:p:h')
-        vim.cmd('edit ' .. vim.fn.fnameescape(dir .. '/' .. file))
-        if anchor then M.jump_to_anchor(anchor) end
-      end
-      return
-    end
+  local path = link_at_cursor(line, col)
+
+  if not path then
+    vim.cmd('normal! gf')
+    return
   end
-  vim.cmd('normal! gf')
+
+  if path:match('^[%a][%w+.-]*:') then
+    vim.ui.open(path)
+    return
+  end
+
+  local file, anchor = path:match('^(.-)(#.*)$')
+  if file == nil then
+    file = path
+  end
+
+  if file == '' and anchor then
+    M.jump_to_anchor(anchor)
+    return
+  end
+
+  edit_file(file)
+  if anchor and anchor ~= '#' then M.jump_to_anchor(anchor) end
+end
+
+local function attach(bufnr)
+  for key in pairs(attached_keys[bufnr] or {}) do
+    pcall(vim.keymap.del, 'n', key, { buffer = bufnr })
+  end
+
+  attached_keys[bufnr] = {}
+  for key, mapping in pairs(config.jump_keys) do
+    local direction, target_level = mapping.direction, mapping.level
+    vim.keymap.set('n', key, function()
+      M.jump(direction, target_level)
+    end, { buffer = bufnr, silent = true, desc = direction .. ' heading ' .. target_level })
+    attached_keys[bufnr][key] = true
+  end
+
+  if config.follow_links then
+    vim.keymap.set('n', 'gf', M.follow_link,
+      { buffer = bufnr, silent = true, desc = 'Follow markdown link' })
+    attached_keys[bufnr].gf = true
+  end
 end
 
 --- Set up buffer-local keymaps for heading navigation and link following.
 --- Called automatically via FileType autocmd, or manually.
----@param opts? { jump_keys?: table<string,{direction:string,level:integer}>, follow_links?: boolean }
+---@param opts? { jump_keys?: table<string,{direction:string,level:integer}>, follow_links?: boolean, style?: "mixed"|"auto"|"atx"|"setext" }
 function M.setup(opts)
   opts = opts or {}
-
-  local jump_keys = opts.jump_keys or {
-    [']1'] = { direction = 'forward',  level = 1 },
-    ['[1'] = { direction = 'backward', level = 1 },
-    [']2'] = { direction = 'forward',  level = 2 },
-    ['[2'] = { direction = 'backward', level = 2 },
-  }
-
-  local follow_links = opts.follow_links ~= false  -- default: true
+  config.jump_keys = opts.jump_keys or default_jump_keys
+  config.follow_links = opts.follow_links ~= false
+  config.style = opts.style or 'mixed'
 
   local augroup = vim.api.nvim_create_augroup('MarkdownHeadings', { clear = true })
   vim.api.nvim_create_autocmd('FileType', {
     group = augroup,
     pattern = 'markdown',
-    callback = function()
-      for key, mapping in pairs(jump_keys) do
-        vim.keymap.set('n', key, function()
-          M.jump(mapping.direction, mapping.level)
-        end, { buffer = true, silent = true, desc = mapping.direction .. ' heading ' .. mapping.level })
-      end
-      if follow_links then
-        vim.keymap.set('n', 'gf', M.follow_link,
-          { buffer = true, silent = true, desc = 'Follow markdown link' })
-      end
+    callback = function(args)
+      attach(args.buf)
     end,
   })
+
+  local current = vim.api.nvim_get_current_buf()
+  if vim.bo[current].filetype == 'markdown' then
+    attach(current)
+  end
 end
 
 return M
